@@ -110,3 +110,11 @@ export function buildDisputeDecisionMessage(disputeId: string, resolution: strin
 export function buildUpdateSolverMessage(address: string): string {
   return `update-solver:${address}`;
 }
+
+/**
+ * Canonical message a solver signs to prove a fill landed in time and cancel
+ * a pending slash during its challenge window (issue #397).
+ */
+export function buildFillProofMessage(intentId: string, solver: string, txHash: string): string {
+  return `fill-proof:${intentId}:${solver}:${txHash}`;
+}

@@ -348,6 +348,20 @@ export const envValidationSchema = Joi.object({
   SOROBAN_RPC_ALLOWLIST: Joi.string().allow("").default(""),
   WEBHOOK_ALLOWLIST: Joi.string().allow("").default(""),
   ORACLE_ALLOWLIST: Joi.string().allow("").default(""),
+
+  // ── Transactional outbox relay (issue #396) ──────────────────────────────
+  // OUTBOX_LEASE_SECONDS must exceed the signed tx time bound (30 s) — see
+  // docs/architecture/onchain-settlement.md#transactional-outbox.
+  OUTBOX_RELAY_ENABLED: Joi.boolean().default(true),
+  OUTBOX_RELAY_INTERVAL_MS: Joi.number().integer().min(100).default(2000),
+  OUTBOX_RELAY_BATCH_SIZE: Joi.number().integer().min(1).max(100).default(10),
+  OUTBOX_MAX_ATTEMPTS: Joi.number().integer().min(1).default(8),
+  OUTBOX_LEASE_SECONDS: Joi.number().integer().min(60).default(120),
+
+  // ── Slashing saga (issue #397) ───────────────────────────────────────────
+  SLASH_CHALLENGE_WINDOW_SECONDS: Joi.number().integer().min(0).default(600),
+  SLASH_CLOCK_SKEW_TOLERANCE_SECONDS: Joi.number().integer().min(0).default(30),
+  SLASH_MAX_SUBMIT_ATTEMPTS: Joi.number().integer().min(1).default(5),
 });
   // ── WS gateway hardening (issue #455) ─────────────────────────────────────
   WS_MAX_PAYLOAD_BYTES: Joi.number().integer().min(1024).default(16384),

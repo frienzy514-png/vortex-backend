@@ -19,6 +19,25 @@ import { MetricsService } from "../metrics/metrics.service";
 const DEFAULT_POLL_INTERVAL_MS = 3_000;
 const DEFAULT_TIMEOUT_MS = 120_000; // 2 minutes
 
+/**
+ * Normalized outcome of a single, non-blocking lookup ({@link TxConfirmationService.check}).
+ *
+ *   success   — applied successfully in a closed ledger.
+ *   failed    — included in a ledger but the invocation failed.
+ *   not_found — unknown to the RPC node: still pending, dropped, or expired
+ *               past its time bound. Callers decide which using their own
+ *               notion of elapsed time.
+ */
+export type TxConfirmationStatus = "success" | "failed" | "not_found";
+
+export interface TxConfirmation {
+  status: TxConfirmationStatus;
+  /** Ledger the transaction was included in (success/failed only). */
+  ledger?: number;
+  /** Ledger close time, unix seconds (success/failed only). */
+  ledgerCloseTime?: number;
+}
+
 export interface ConfirmationResult {
   hash: string;
   status: "SUCCESS" | "FAILED" | "TIMEOUT";
@@ -38,6 +57,29 @@ export class TxConfirmationService {
     private readonly sorobanService: SorobanService,
     @Optional() private readonly metricsService?: MetricsService,
   ) {}
+
+  /**
+   * Single, non-blocking lookup of `hash` (issues #396 / #397).
+   *
+   * For durable callers — the outbox relay and the slashing saga — that
+   * persist the hashes they wait on and re-check on their own schedule, so a
+   * restart never loses an in-flight transaction and a worker tick never
+   * blocks for the full {@link waitForConfirmation} timeout. RPC transport
+   * errors propagate so callers can retry rather than mistake an outage for
+   * NOT_FOUND.
+   */
+  async check(hash: string): Promise<TxConfirmation> {
+    const response = await this.sorobanService.getTransaction(hash);
+    switch (response.status) {
+      case SorobanRpc.Api.GetTransactionStatus.SUCCESS:
+        return { status: "success", ledger: response.ledger, ledgerCloseTime: response.createdAt };
+      case SorobanRpc.Api.GetTransactionStatus.FAILED:
+        this.logger.warn(`[tx-confirmation] tx ${hash} failed in ledger ${response.ledger}`);
+        return { status: "failed", ledger: response.ledger, ledgerCloseTime: response.createdAt };
+      default:
+        return { status: "not_found" };
+    }
+  }
 
   /**
    * Poll until the transaction identified by `hash` reaches a terminal state.

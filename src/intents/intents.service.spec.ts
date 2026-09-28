@@ -7,6 +7,8 @@ import { IntentsService } from "./intents.service";
 import { INTENTS_REPOSITORY, InMemoryIntentsRepository } from "./intents.repository";
 import { PrismaService } from "../prisma/prisma.service";
 import { ProtocolParamsService } from "../governance/params.service";
+import { InMemoryOutboxRepository } from "../soroban/outbox.repository";
+import { InMemoryIntentsUnitOfWork } from "./intents.unit-of-work";
 
 const VALID_CONTRACT_ID = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
 
@@ -367,76 +369,126 @@ describe("IntentsService", () => {
     });
   });
 
-  describe("on-chain registration (ONCHAIN_INTENTS_ENABLED)", () => {
-    it("stays fully in the repository when the flag is off, never touching StellarTxService", async () => {
+  describe("on-chain writes via the transactional outbox (ONCHAIN_INTENTS_ENABLED, #396)", () => {
+    function makeOutboxService(onchain: boolean, settlementContractId = VALID_CONTRACT_ID) {
       const stellarTxService = fakeStellarTxService();
-      const svc = makeService({ onchainIntentsEnabled: false }, stellarTxService);
+      const repo = new InMemoryIntentsRepository();
+      const outbox = new InMemoryOutboxRepository();
+      const service = new IntentsService(
+        repo,
+        fakeConfig({ onchainIntentsEnabled: onchain, settlementContractId }),
+        stellarTxService,
+        fakePrismaService(),
+        undefined, // shadowService
+        undefined, // metricsService
+        fakeProtocolParamsService(),
+        undefined, // flags
+        new InMemoryIntentsUnitOfWork(repo, outbox),
+      );
+      return { service, outbox, stellarTxService, repo };
+    }
+
+    it("stays fully off-chain when the flag is off: no outbox rows, no StellarTxService", async () => {
+      const { service, outbox, stellarTxService } = makeOutboxService(false);
 
       const intent = await service.create(validCreateData());
 
       expect(stellarTxService.invokeContract).not.toHaveBeenCalled();
+      expect(await outbox.findByIntent(intent.intentId)).toEqual([]);
       expect(await service.get(intent.intentId)).toEqual(intent);
     });
 
-    it("invokes the settlement contract and preserves the Intent shape when the flag is on", async () => {
-      const stellarTxService = fakeStellarTxService();
-      stellarTxService.invokeContract.mockResolvedValue({ hash: "deadbeef", status: "SUCCESS" } as never);
-      const svc = makeService(
-        { onchainIntentsEnabled: true, settlementContractId: VALID_CONTRACT_ID },
-        stellarTxService,
-      );
+    it("commits the intent and a create_intent outbox row together, without submitting inline", async () => {
+      const { service, outbox, stellarTxService } = makeOutboxService(true);
 
-      const data = validCreateData();
-      const intent = await service.create(data);
+      const intent = await service.create(validCreateData());
 
-      expect(stellarTxService.invokeContract).toHaveBeenCalledTimes(1);
-      const call = stellarTxService.invokeContract.mock.calls[0][0];
-      expect(call.contractId).toBe(VALID_CONTRACT_ID);
-      expect(call.method).toBe("create_intent");
-
-      // response shape is unchanged relative to the in-memory path
-      expect(Object.keys(intent).sort()).toEqual(
-        Object.keys({
-          intentId: "",
-          user: "",
-          srcChain: "",
-          srcToken: "",
-          srcAmount: "",
-          dstToken: "",
-          minDstAmount: "",
-          state: "",
-          createdAt: 0,
-          deadline: 0,
-        }).sort(),
-      );
-      expect(await service.get(intent.intentId)).toBeDefined();
+      expect(stellarTxService.invokeContract).not.toHaveBeenCalled();
+      const rows = await outbox.findByIntent(intent.intentId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        operation: "create_intent",
+        status: "pending",
+        payload: expect.objectContaining({ intentId: intent.intentId, srcAmount: "1000000" }),
+      });
+      expect(await service.get(intent.intentId)).toEqual(intent);
     });
 
-    it("rejects with a clear error and does not create the intent when SETTLEMENT_CONTRACT_ID is unset", async () => {
-      const stellarTxService = fakeStellarTxService();
-      const service = makeService({ onchainIntentsEnabled: true }, stellarTxService);
-      const before = (await service.getAll()).length;
-      const svc = makeService({ onchainIntentsEnabled: true }, stellarTxService);
-      const before = (await svc.getAll()).length;
+    it("rejects with a clear error and writes nothing when SETTLEMENT_CONTRACT_ID is unset", async () => {
+      const { service, outbox, repo } = makeOutboxService(true, "");
+      const before = repo.findAll().length;
 
       await expect(service.create(validCreateData())).rejects.toMatchObject({
         message: expect.stringContaining("SETTLEMENT_CONTRACT_ID"),
       });
-      expect(stellarTxService.invokeContract).not.toHaveBeenCalled();
-      expect(await service.getAll()).toHaveLength(before);
+      expect(repo.findAll()).toHaveLength(before);
+      expect((await outbox.countByStatus()).pending).toBe(0);
     });
 
-    it("rejects and does not create the intent when the on-chain call fails", async () => {
-      const stellarTxService = fakeStellarTxService();
-      stellarTxService.invokeContract.mockRejectedValue(new Error("submission failed after 5 attempts"));
-      const svc = makeService(
-        { onchainIntentsEnabled: true, settlementContractId: VALID_CONTRACT_ID },
-        stellarTxService,
-      );
-      const before = (await service.getAll()).length;
+    it("rejects a payload that cannot be encoded instead of creating a poison row", async () => {
+      const { service, outbox } = makeOutboxService(true);
 
-      await expect(service.create(validCreateData())).rejects.toThrow(/settlement contract/i);
-      expect(await service.getAll()).toHaveLength(before);
+      await expect(service.create({ ...validCreateData(), user: "not-a-stellar-address" })).rejects.toThrow();
+      expect((await outbox.countByStatus()).pending).toBe(0);
+    });
+
+    it("drops the outbox row when the intent write fails (atomic unit of work)", async () => {
+      const { service, outbox, repo } = makeOutboxService(true);
+      jest.spyOn(repo, "save").mockImplementationOnce(() => {
+        throw new Error("db down");
+      });
+
+      await expect(service.create(validCreateData())).rejects.toThrow("db down");
+      expect((await outbox.countByStatus()).pending).toBe(0);
+    });
+
+    it("enqueues accept, fill and cancel transitions in order, and nothing for a lost race", async () => {
+      const { service, outbox } = makeOutboxService(true);
+      const solver = Keypair.random().publicKey();
+
+      const a = await service.create(validCreateData());
+      expect(await service.acceptIfOpen(a.intentId, solver)).not.toBeNull();
+      expect(await service.acceptIfOpen(a.intentId, solver)).toBeNull(); // lost race → no row
+      expect(
+        await service.fillIfAccepted(a.intentId, solver, { fillAmount: "995000", txHash: "ab".repeat(32) }),
+      ).not.toBeNull();
+
+      const b = await service.create(validCreateData());
+      expect(await service.cancelIfOpen(b.intentId)).not.toBeNull();
+
+      expect((await outbox.findByIntent(a.intentId)).map((r) => r.operation)).toEqual([
+        "create_intent",
+        "accept_intent",
+        "fill_intent",
+      ]);
+      expect((await outbox.findByIntent(b.intentId)).map((r) => r.operation)).toEqual([
+        "create_intent",
+        "cancel_intent",
+      ]);
+    });
+
+    it("follows the onchain-intents-enabled runtime flag per intent when flags are wired", async () => {
+      const repo = new InMemoryIntentsRepository();
+      const outbox = new InMemoryOutboxRepository();
+      const flags = { getBooleanValue: jest.fn().mockResolvedValue(true) };
+      const service = new IntentsService(
+        repo,
+        fakeConfig({ onchainIntentsEnabled: false, settlementContractId: VALID_CONTRACT_ID }),
+        fakeStellarTxService(),
+        fakePrismaService(),
+        undefined,
+        undefined,
+        fakeProtocolParamsService(),
+        flags as never,
+        new InMemoryIntentsUnitOfWork(repo, outbox),
+      );
+
+      const intent = await service.create(validCreateData());
+      expect(flags.getBooleanValue).toHaveBeenCalledWith("onchain-intents-enabled", {
+        targetingKey: intent.intentId,
+        chain: "ethereum",
+      });
+      expect(await outbox.findByIntent(intent.intentId)).toHaveLength(1);
     });
   });
 

@@ -78,6 +78,8 @@ function makeConfigService(
       eventLoopMaxLagMs: 1000,
       rpcHealthUrls: ["https://soroban-testnet.stellar.org"],
     },
+    outbox: { relayEnabled: false, relayIntervalMs: 2000, batchSize: 10, maxAttempts: 8, leaseSeconds: 120 },
+    slashing: { challengeWindowSeconds: 600, clockSkewToleranceSeconds: 30, maxSubmitAttempts: 5 },
   };
   return {
     get: (key: string) => {

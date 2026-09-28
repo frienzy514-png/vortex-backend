@@ -4,6 +4,9 @@ import { IIntentsRepository } from "./intents.repository";
 import { Intent, IntentState, StellarToken, TokenInfo } from "./intents.types";
 import { IntentState as PrismaIntentState, Prisma } from "@prisma/client";
 
+/** PrismaService, or the client handed to a `$transaction` callback (issue #396). */
+export type IntentsPrismaClient = PrismaService | Prisma.TransactionClient;
+
 /**
  * Prisma-backed implementation of IIntentsRepository.
  *
@@ -18,7 +21,7 @@ import { IntentState as PrismaIntentState, Prisma } from "@prisma/client";
  */
 @Injectable()
 export class PrismaIntentsRepository implements IIntentsRepository {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly prisma: IntentsPrismaClient) {}
 
   async save(intent: Intent): Promise<Intent> {
     const data = this.toDbData(intent);

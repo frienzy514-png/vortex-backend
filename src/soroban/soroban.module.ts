@@ -10,6 +10,7 @@ import { SolverRegistryService } from "./solver-registry.service";
 import { SignerService } from "./signer.service";
 import { StellarTxService } from "./stellar-tx.service";
 import { TxConfirmationService } from "./tx-confirmation.service";
+import { FillVerifierService } from "./fill-verifier.service";
 import { SolverRegistryEventsService } from "./events/solver-registry-events.service";
 import { SIGNER_TOKEN, signerFactory } from "./signers/signer.factory";
 import { SolversModule } from "../solvers/solvers.module";
@@ -67,6 +68,8 @@ import { IntentsModule } from "../intents/intents.module";
     // Issue #401 — shadow-mode divergence monitor. Exported so IntentsService
     // can report off-chain transitions to it without importing Soroban internals.
     ShadowService,
+    // Issue #397 — slashing saga's on-chain fill re-verification.
+    FillVerifierService,
   ],
   exports: [
     SorobanService,
@@ -77,6 +80,7 @@ import { IntentsModule } from "../intents/intents.module";
     EventIngestionService,
     SolverRegistryEventsService,
     ShadowService,
+    FillVerifierService,
   ],
 })
 export class SorobanModule {}

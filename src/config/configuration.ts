@@ -281,6 +281,29 @@ export interface AppConfig {
     /** Soroban RPC endpoints probed for quorum (majority must be healthy). */
     rpcHealthUrls: string[];
   };
+  /** Transactional outbox relay for on-chain writes (issue #396). */
+  outbox: {
+    /** Kill switch for the relay worker. Rows keep accumulating while false. */
+    relayEnabled: boolean;
+    relayIntervalMs: number;
+    batchSize: number;
+    /** Claims after which a row is moved to `dead` and alerted on. */
+    maxAttempts: number;
+    /**
+     * Processing lease. Must exceed the signed transaction's time bound so a
+     * reclaimed row whose envelope is NOT_FOUND can be safely resubmitted.
+     */
+    leaseSeconds: number;
+  };
+  /** On-chain slashing saga (issue #397). */
+  slashing: {
+    /** Delay between detection and broadcast during which a slash can be cancelled. */
+    challengeWindowSeconds: number;
+    /** Grace added to the fill deadline when judging whether a fill landed in time. */
+    clockSkewToleranceSeconds: number;
+    /** Failed submissions after which the slash is cancelled and compensated. */
+    maxSubmitAttempts: number;
+  };
 }
 
 export default (): AppConfig => ({
@@ -394,6 +417,18 @@ export default (): AppConfig => ({
       .split(",")
       .map((u) => u.trim())
       .filter(Boolean),
+  },
+  outbox: {
+    relayEnabled: (process.env.OUTBOX_RELAY_ENABLED ?? "true") === "true",
+    relayIntervalMs: parseInt(process.env.OUTBOX_RELAY_INTERVAL_MS ?? "2000", 10),
+    batchSize: parseInt(process.env.OUTBOX_RELAY_BATCH_SIZE ?? "10", 10),
+    maxAttempts: parseInt(process.env.OUTBOX_MAX_ATTEMPTS ?? "8", 10),
+    leaseSeconds: parseInt(process.env.OUTBOX_LEASE_SECONDS ?? "120", 10),
+  },
+  slashing: {
+    challengeWindowSeconds: parseInt(process.env.SLASH_CHALLENGE_WINDOW_SECONDS ?? "600", 10),
+    clockSkewToleranceSeconds: parseInt(process.env.SLASH_CLOCK_SKEW_TOLERANCE_SECONDS ?? "30", 10),
+    maxSubmitAttempts: parseInt(process.env.SLASH_MAX_SUBMIT_ATTEMPTS ?? "5", 10),
   },
 });
 

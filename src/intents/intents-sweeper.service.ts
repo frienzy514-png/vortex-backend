@@ -2,7 +2,7 @@ import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from "@nestjs/commo
 import { IntentsService } from "./intents.service";
 import { IntentsGateway } from "./intents.gateway";
 import { SolversService } from "../solvers/solvers.service";
-import { SolverRegistryService } from "../soroban/solver-registry.service";
+import { SlashingPipelineService } from "./slashing-pipeline.service";
 import { logger } from "../common/logger";
 import { MetricsService } from "../metrics/metrics.service";
 import { KillSwitchService } from "../killswitch/killswitch.service";
@@ -34,7 +34,7 @@ export class IntentsSweeperService implements OnModuleInit, OnModuleDestroy {
     private readonly intentsService: IntentsService,
     private readonly intentsGateway: IntentsGateway,
     private readonly solversService: SolversService,
-    private readonly solverRegistryService: SolverRegistryService,
+    private readonly slashingPipeline: SlashingPipelineService,
     private readonly metricsService: MetricsService,
     private readonly killSwitch: KillSwitchService,
     private readonly leaderElection: LeaderElectionService,
@@ -136,7 +136,7 @@ export class IntentsSweeperService implements OnModuleInit, OnModuleDestroy {
         continue;
       }
 
-      const slashed = await this.slashMissedFill(intent.intentId, intent.solver, now);
+      const slashed = await this.slashMissedFill(intent.intentId, intent.solver, intent.deadline, now);
       if (slashed) slashedCount++;
     }
 
@@ -197,9 +197,16 @@ export class IntentsSweeperService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * Detection half of the slashing saga (issue #397). Marks the intent
+   * `slashed`, applies the optimistic local penalty, and hands off to
+   * SlashingPipelineService, which holds the slash in a challenge window,
+   * re-verifies, and only then broadcasts — nothing is sent on-chain here.
+   */
   private async slashMissedFill(
     intentId: string,
     solver: string | undefined,
+    fillDeadline: number,
     now: number,
   ): Promise<boolean> {
     const reason = "accepted intent not filled before deadline";
@@ -215,7 +222,7 @@ export class IntentsSweeperService implements OnModuleInit, OnModuleDestroy {
       solver,
       slashedAt: now,
     });
-    await this.intentsGateway.broadcast({ type: "intent_slashed", intentId, solver, reason });
+    await this.intentsGateway.broadcast({ type: "intent_slashed", intentId, solver, reason, pending: true });
 
     if (!solver) {
       // Shouldn't happen in practice — an "accepted" intent always has a
@@ -224,16 +231,21 @@ export class IntentsSweeperService implements OnModuleInit, OnModuleDestroy {
       return true;
     }
 
+    // Optimistic local penalty; the saga compensates via rollbackPenalty if
+    // the slash is cancelled.
     await this.solversService.recordFailedFill(solver, intentId);
     const slashRecord = await this.solversService.recordSlash(solver, intentId, reason, now);
 
-    const result = await this.solverRegistryService.slashSolver({
-      solverAddress: solver,
+    const pending = await this.slashingPipeline.detect({
       intentId,
+      solverAddress: solver,
       reason,
+      fillDeadline,
+      detectedAt: now,
     });
-    console.log(
-      `[sweeper] slashed solver=${solver} for intent=${intentId}: ${result.detail} slashId=${slashRecord?.slashId ?? "unknown"}`,
+    this.logger.log(
+      `[sweeper] slash detected solver=${solver} intent=${intentId} state=${pending.state} ` +
+        `challengeEndsAt=${pending.challengeEndsAt.toISOString()} slashId=${slashRecord?.slashId ?? "unknown"}`,
     );
     return true;
   }

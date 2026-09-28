@@ -17,6 +17,26 @@ import { SorobanModule } from "../soroban/soroban.module";
 import { AppConfig } from "../config/configuration";
 import { PrismaService } from "../prisma/prisma.service";
 import { GovernanceModule } from "../governance/governance.module";
+import {
+  INTENTS_UNIT_OF_WORK,
+  InMemoryIntentsUnitOfWork,
+  PrismaIntentsUnitOfWork,
+} from "./intents.unit-of-work";
+import { IIntentsRepository } from "./intents.repository";
+import { InMemoryOutboxRepository, OUTBOX_REPOSITORY } from "../soroban/outbox.repository";
+import { PrismaOutboxRepository } from "../soroban/prisma-outbox.repository";
+import { OutboxRelayService } from "../soroban/outbox-relay.service";
+import {
+  InMemoryPendingSlashesRepository,
+  PENDING_SLASHES_REPOSITORY,
+} from "../solvers/pending-slashes.repository";
+import { PrismaPendingSlashesRepository } from "../solvers/prisma-pending-slashes.repository";
+import { SlashingPipelineService } from "./slashing-pipeline.service";
+import { AdminSlashesController, SlashesController } from "./slashes.controller";
+import { OutboxAdminController } from "../soroban/outbox-admin.controller";
+
+/** The outbox, unit of work, and slash saga share INTENTS_PERSISTENCE with the intents store. */
+const usePrisma = () => (process.env.INTENTS_PERSISTENCE ?? "memory") === "prisma";
 
 @Module({
   // Both SolversModule and SorobanModule import IntentsModule back, so both
@@ -32,7 +52,7 @@ import { GovernanceModule } from "../governance/governance.module";
     forwardRef(() => SorobanModule),
   ],
   imports: [forwardRef(() => SolversModule), RoutingModule, TokensModule, SorobanModule, GovernanceModule],
-  controllers: [IntentsController],
+  controllers: [IntentsController, SlashesController, AdminSlashesController, OutboxAdminController],
   providers: [
     // Select the persistence adapter based on INTENTS_PERSISTENCE env var.
     // INTENTS_PERSISTENCE=prisma  → PrismaIntentsRepository (production/staging)
@@ -48,6 +68,34 @@ import { GovernanceModule } from "../governance/governance.module";
         return new InMemoryIntentsRepository();
       },
     },
+    // Transactional outbox (issue #396).
+    {
+      provide: OUTBOX_REPOSITORY,
+      inject: [PrismaService],
+      useFactory: (prisma: PrismaService) =>
+        usePrisma() ? new PrismaOutboxRepository(prisma) : new InMemoryOutboxRepository(),
+    },
+    {
+      provide: INTENTS_UNIT_OF_WORK,
+      inject: [PrismaService, INTENTS_REPOSITORY, OUTBOX_REPOSITORY],
+      useFactory: (
+        prisma: PrismaService,
+        intents: IIntentsRepository,
+        outbox: InMemoryOutboxRepository | PrismaOutboxRepository,
+      ) =>
+        outbox instanceof InMemoryOutboxRepository
+          ? new InMemoryIntentsUnitOfWork(intents, outbox)
+          : new PrismaIntentsUnitOfWork(prisma),
+    },
+    OutboxRelayService,
+    // Slashing saga (issue #397).
+    {
+      provide: PENDING_SLASHES_REPOSITORY,
+      inject: [PrismaService],
+      useFactory: (prisma: PrismaService) =>
+        usePrisma() ? new PrismaPendingSlashesRepository(prisma) : new InMemoryPendingSlashesRepository(),
+    },
+    SlashingPipelineService,
     IntentsService,
     IntentCapabilityIndex,
     backplaneProvider,

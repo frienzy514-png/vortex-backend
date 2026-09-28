@@ -101,6 +101,13 @@ export class MetricsService implements OnModuleInit {
 
   // ── Solver-registry event ingestion (issue #399) ──────────────────────────
   public readonly solverRegistryEventsTotal: client.Counter<string>;
+  /** Transactional outbox relay (issue #396). */
+  public readonly outboxRelayOutcomes: client.Counter<string>;
+  public readonly outboxDeadTotal: client.Counter<string>;
+  public readonly outboxBacklog: client.Gauge<string>;
+
+  /** Slashing saga (issue #397). */
+  public readonly slashTransitions: client.Counter<string>;
 
   constructor(private readonly configService: ConfigService<AppConfig, true>) {
     this.register = new client.Registry();
@@ -391,6 +398,34 @@ export class MetricsService implements OnModuleInit {
     provider: () => Promise<Array<{ queue: string; state: string; count: number }>>,
   ): void {
     this.queueDepthProvider = provider;
+    // ── Outbox relay (issue #396) ───────────────────────────────────────────
+    this.outboxRelayOutcomes = new client.Counter({
+      name: `${prefix}outbox_relay_outcomes_total`,
+      help: "Outbox rows processed by the relay, by outcome (submitted|simulated|confirmed|retry|dead)",
+      labelNames: ["outcome"],
+      registers: [this.register],
+    });
+
+    this.outboxDeadTotal = new client.Counter({
+      name: `${prefix}outbox_dead_total`,
+      help: "Outbox rows moved to dead after exhausting OUTBOX_MAX_ATTEMPTS (page on any increase)",
+      registers: [this.register],
+    });
+
+    this.outboxBacklog = new client.Gauge({
+      name: `${prefix}outbox_rows`,
+      help: "Current number of outbox rows by status",
+      labelNames: ["status"],
+      registers: [this.register],
+    });
+
+    // ── Slashing saga (issue #397) ──────────────────────────────────────────
+    this.slashTransitions = new client.Counter({
+      name: `${prefix}slash_pipeline_transitions_total`,
+      help: "Pending-slash state transitions, by target state and reason",
+      labelNames: ["to_state", "reason"],
+      registers: [this.register],
+    });
   }
 
   onModuleInit() {
@@ -536,5 +571,21 @@ export class MetricsService implements OnModuleInit {
   recordLeadershipLost(workerName: string): void {
     this.leaderElectionIsLeader.set({ worker: workerName }, 0);
     this.leaderElectionChangesTotal.inc({ worker: workerName, transition: "lost" });
+  }
+
+  /** One outbox row outcome; `dead` also feeds the alerting counter. */
+  recordOutboxOutcome(outcome: "submitted" | "simulated" | "confirmed" | "retry" | "dead"): void {
+    this.outboxRelayOutcomes.inc({ outcome });
+    if (outcome === "dead") this.outboxDeadTotal.inc();
+  }
+
+  setOutboxBacklog(counts: Record<string, number>): void {
+    for (const [status, count] of Object.entries(counts)) {
+      this.outboxBacklog.set({ status }, count);
+    }
+  }
+
+  recordSlashTransition(toState: string, reason = "none"): void {
+    this.slashTransitions.inc({ to_state: toState, reason });
   }
 }

@@ -6,7 +6,7 @@ import { KillSwitchService } from "../killswitch/killswitch.service";
 import { IntentsService } from "./intents.service";
 import { IntentsGateway } from "./intents.gateway";
 import { SolversService } from "../solvers/solvers.service";
-import { SolverRegistryService } from "../soroban/solver-registry.service";
+import { SlashingPipelineService } from "./slashing-pipeline.service";
 import { MetricsService } from "../metrics/metrics.service";
 import { InMemorySolversRepository } from "../solvers/in-memory-solvers.repository";
 import { SOLVERS_REPOSITORY } from "../solvers/solvers.repository";
@@ -51,7 +51,7 @@ function buildIntentsService(): IntentsService {
   const protocolParams = {
     snapshotForChain: jest.fn().mockReturnValue({ version: 0, feeBps: 30, deadlineSeconds: 1800, fillWindowSeconds: 600, capturedAt: new Date().toISOString() }),
   } as unknown as ProtocolParamsService;
-  return new IntentsService(repo, configService, stellarTxService, prismaService, protocolParams);
+  return new IntentsService(repo, configService, stellarTxService, prismaService, undefined, undefined, protocolParams);
 }
 
 async function buildSolversService(): Promise<SolversService> {
@@ -68,7 +68,7 @@ describe("IntentsSweeperService", () => {
   let intentsService: IntentsService;
   let gateway: IntentsGateway;
   let solversService: SolversService;
-  let solverRegistryService: jest.Mocked<SolverRegistryService>;
+  let slashingPipeline: jest.Mocked<Pick<SlashingPipelineService, "detect">>;
   let metricsService: jest.Mocked<Pick<MetricsService, "recordSweep">>;
   let killSwitch: jest.Mocked<Pick<KillSwitchService, "evaluateTarget">>;
   let sweeper: IntentsSweeperService;
@@ -77,13 +77,13 @@ describe("IntentsSweeperService", () => {
     intentsService = buildIntentsService();
     gateway = { broadcast: jest.fn().mockResolvedValue(undefined) } as unknown as IntentsGateway;
     solversService = await buildSolversService();
-    solverRegistryService = {
-      slashSolver: jest.fn().mockResolvedValue({
-        submitted: false,
-        simulated: false,
-        detail: "not configured — no-op",
-      }),
-    } as unknown as jest.Mocked<SolverRegistryService>;
+    slashingPipeline = {
+      detect: jest.fn().mockImplementation(async (input) => ({
+        ...input,
+        state: "challenge_window",
+        challengeEndsAt: new Date((input.detectedAt + 600) * 1000),
+      })),
+    } as unknown as jest.Mocked<Pick<SlashingPipelineService, "detect">>;
     metricsService = { recordSweep: jest.fn() } as unknown as jest.Mocked<Pick<MetricsService, "recordSweep">>;
     // Default: no pause active, so existing sweeper expectations are unchanged.
     killSwitch = {
@@ -94,7 +94,7 @@ describe("IntentsSweeperService", () => {
       intentsService,
       gateway,
       solversService,
-      solverRegistryService,
+      slashingPipeline as unknown as SlashingPipelineService,
       metricsService as unknown as MetricsService,
       killSwitch as unknown as KillSwitchService,
       noopLeaderElection(),
@@ -149,8 +149,9 @@ describe("IntentsSweeperService", () => {
     expect(gateway.broadcast).toHaveBeenCalledWith(
       expect.objectContaining({ type: "intent_slashed", intentId, solver: ALPHA_ADDR }),
     );
-    expect(solverRegistryService.slashSolver).toHaveBeenCalledWith(
-      expect.objectContaining({ solverAddress: ALPHA_ADDR, intentId }),
+    // Issue #397: the sweeper only detects — the saga owns the on-chain slash.
+    expect(slashingPipeline.detect).toHaveBeenCalledWith(
+      expect.objectContaining({ solverAddress: ALPHA_ADDR, intentId, fillDeadline: past }),
     );
   });
 
@@ -184,7 +185,7 @@ describe("IntentsSweeperService", () => {
     await sweeper.sweep();
 
     expect((await intentsService.get(intentId))?.state).toBe("accepted");
-    expect(solverRegistryService.slashSolver).not.toHaveBeenCalled();
+    expect(slashingPipeline.detect).not.toHaveBeenCalled();
   });
 
   it("does not throw if an accepted intent somehow has no solver on record", async () => {
@@ -202,7 +203,7 @@ describe("IntentsSweeperService", () => {
 
     await expect(sweeper.sweep()).resolves.not.toThrow();
     expect((await intentsService.get(intent.intentId))?.state).toBe("slashed");
-    expect(solverRegistryService.slashSolver).not.toHaveBeenCalled();
+    expect(slashingPipeline.detect).not.toHaveBeenCalled();
   });
 
   // ── #259: MetricsService integration ────────────────────────────────────
@@ -271,7 +272,7 @@ describe("IntentsSweeperService", () => {
       // Not slashed — the pause, not the solver, caused the missed fill.
       expect(result.slashedCount).toBe(0);
       expect(result.extendedDeadlines).toBe(1);
-      expect(solverRegistryService.slashSolver).not.toHaveBeenCalled();
+      expect(slashingPipeline.detect).not.toHaveBeenCalled();
 
       const updated = await intentsService.get(intentId);
       expect(updated?.state).toBe("accepted");

@@ -24,6 +24,19 @@ import { MetricsService } from "../metrics/metrics.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { ProtocolParamsService } from "../governance/params.service";
 import { FeatureFlagService } from "../flags/feature-flag.service";
+import {
+  IIntentsUnitOfWork,
+  INTENTS_UNIT_OF_WORK,
+  InMemoryIntentsUnitOfWork,
+} from "./intents.unit-of-work";
+import { InMemoryOutboxRepository, IOutboxWriter, NewOutboxEntry } from "../soroban/outbox.repository";
+import {
+  acceptIntentEntry,
+  buildOutboxInvocation,
+  cancelIntentEntry,
+  createIntentEntry,
+  fillIntentEntry,
+} from "../soroban/outbox-operations";
 
 const TERMINAL_STATES: IntentState[] = ["filled", "cancelled", "expired", "slashed"];
 
@@ -103,6 +116,13 @@ export class IntentsService {
    */
   private readonly auditLog = new Map<string, IntentAuditEntry[]>();
 
+  /**
+   * Commits intent mutations together with their outbox rows (issue #396).
+   * Falls back to an in-memory unit of work over `repo` when not injected
+   * (unit tests that construct the service directly).
+   */
+  private readonly unitOfWork: IIntentsUnitOfWork;
+
   constructor(
     @Inject(INTENTS_REPOSITORY)
     private readonly repo: IIntentsRepository,
@@ -130,7 +150,10 @@ export class IntentsService {
     @Optional() private readonly metricsService?: MetricsService,
     private readonly protocolParamsService: ProtocolParamsService,
     @Optional() private readonly flags?: FeatureFlagService,
-  ) {}
+    @Optional() @Inject(INTENTS_UNIT_OF_WORK) unitOfWork?: IIntentsUnitOfWork,
+  ) {
+    this.unitOfWork = unitOfWork ?? new InMemoryIntentsUnitOfWork(repo, new InMemoryOutboxRepository());
+  }
 
   /**
    * Logs the store size and evicts stale terminal intents from the in-memory
@@ -256,17 +279,16 @@ export class IntentsService {
 
     // ONCHAIN_INTENTS_ENABLED is the default; the `onchain-intents-enabled`
     // runtime flag (issue #495) can roll it out per chain / percentage.
-    const onchain = this.flags
-      ? await this.flags.getBooleanValue("onchain-intents-enabled", {
-          targetingKey: intent.intentId,
-          chain: intent.srcChain,
-        })
-      : this.configService.get("onchainIntentsEnabled", { infer: true });
-    if (onchain) {
-      await this.registerOnChain(intent);
+    if (await this.onchainEnabledFor(intent)) {
+      // Issue #396: intent row + create_intent outbox row commit atomically;
+      // OutboxRelayService submits afterwards, never inside this request.
+      await this.unitOfWork.run(async ({ intents, outbox }) => {
+        await this.registerOnChain(intent, outbox);
+        await intents.save(intent);
+      });
+    } else {
+      await this.repo.save(intent);
     }
-
-    await this.repo.save(intent);
     // Creation is the entry edge of the funnel: the `vortex:intent:*` recording
     // rules count transitions *into* each state, so without this the intent
     // dashboard would start every conversion ratio from zero. `from_state` is
@@ -276,46 +298,64 @@ export class IntentsService {
   }
 
   /**
-   * Registers `intent` with the settlement contract. Only called when
-   * ONCHAIN_INTENTS_ENABLED is on; while that flag is off, create() stays
-   * fully in-memory (the rollout fallback).
+   * Queues the settlement contract's `create_intent` call for `intent` on the
+   * outbox (issue #396). Only called when on-chain intents are enabled for
+   * this intent; otherwise create() stays fully off-chain (the rollout
+   * fallback). Nothing is broadcast here — the request never waits on Soroban,
+   * and a Soroban outage can no longer fail intent creation.
    */
-  private async registerOnChain(intent: Intent): Promise<void> {
+  private async registerOnChain(intent: Intent, outbox: IOutboxWriter): Promise<void> {
+    await this.enqueueOnchain(outbox, createIntentEntry(intent));
+    this.logger.log(`Queued on-chain registration for intent ${intent.intentId}`);
+  }
+
+  /**
+   * Validates that `entry` encodes to a contract call (so malformed input is
+   * rejected in the request instead of becoming a poison row) and enqueues it.
+   */
+  private async enqueueOnchain(outbox: IOutboxWriter, entry: NewOutboxEntry): Promise<void> {
     const contractId = this.configService.get("stellar.settlementContractId", { infer: true });
     if (!contractId) {
       throw new ServiceUnavailableException(
         "On-chain intent registration is enabled but SETTLEMENT_CONTRACT_ID is not configured",
       );
     }
-
-    try {
-      const result = await this.stellarTxService.invokeContract({
-        contractId,
-        method: "create_intent",
-        args: this.buildCreateIntentArgs(intent),
-      });
-      this.logger.log(`Registered intent ${intent.intentId} on-chain (tx ${result.hash})`);
-    } catch (err) {
-      this.logger.error(
-        `Failed to register intent ${intent.intentId} on-chain: ${(err as Error).message}`,
-      );
-      throw new ServiceUnavailableException(
-        "Failed to register intent with the settlement contract",
-      );
-    }
+    buildOutboxInvocation(entry, contractId);
+    await outbox.enqueue(entry);
   }
 
-  private buildCreateIntentArgs(intent: Intent): xdr.ScVal[] {
-    return [
-      nativeToScVal(intent.intentId, { type: "string" }),
-      new Address(intent.user).toScVal(),
-      nativeToScVal(intent.srcChain, { type: "symbol" }),
-      nativeToScVal(intent.srcToken.address, { type: "string" }),
-      nativeToScVal(BigInt(intent.srcAmount), { type: "i128" }),
-      new Address(intent.dstToken.contract).toScVal(),
-      nativeToScVal(BigInt(intent.minDstAmount), { type: "i128" }),
-      nativeToScVal(intent.deadline, { type: "u64" }),
-    ];
+  /**
+   * Whether `intent`'s state changes are mirrored on-chain. Evaluated with the
+   * same targeting (intent id + source chain) for every transition, so a
+   * percentage rollout never splits one intent's lifecycle across paths.
+   */
+  private async onchainEnabledFor(intent: Pick<Intent, "intentId" | "srcChain">): Promise<boolean> {
+    return Boolean(
+      this.flags
+        ? await this.flags.getBooleanValue("onchain-intents-enabled", {
+            targetingKey: intent.intentId,
+            chain: intent.srcChain,
+          })
+        : this.configService.get("onchainIntentsEnabled", { infer: true }),
+    );
+  }
+
+  /**
+   * Applies a guarded state transition and, when on-chain writes are enabled
+   * for the intent, enqueues the mirroring contract call in the same unit of
+   * work (issue #396). A `null` transition (guard failed) enqueues nothing.
+   */
+  private transitionWithOutbox(
+    mutate: (intents: IIntentsRepository) => Promise<Intent | null> | Intent | null,
+    toEntry: (updated: Intent) => NewOutboxEntry,
+  ): Promise<Intent | null> {
+    return this.unitOfWork.run(async ({ intents, outbox }) => {
+      const updated = await mutate(intents);
+      if (updated && (await this.onchainEnabledFor(updated))) {
+        await this.enqueueOnchain(outbox, toEntry(updated));
+      }
+      return updated;
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -512,7 +552,10 @@ export class IntentsService {
     const nowSec = now ?? Math.floor(Date.now() / 1000);
     const fillWindow =
       CHAIN_FILL_WINDOW_DEFAULTS[intent.srcChain] ?? DEFAULT_FILL_WINDOW_SECONDS;
-    const updated = await this.repo.acceptIfOpen(id, solver, nowSec + fillWindow, nowSec);
+    const updated = await this.transitionWithOutbox(
+      (intents) => intents.acceptIfOpen(id, solver, nowSec + fillWindow, nowSec),
+      acceptIntentEntry,
+    );
     if (updated !== null) this.countTransition("open", "accepted");
     if (this.beginShadowObservation()) {
       this.observeAccept(updated ?? intent, solver, updated !== null);
@@ -551,7 +594,10 @@ export class IntentsService {
     now?: number,
   ): Promise<Intent | null> {
     const nowSec = now ?? Math.floor(Date.now() / 1000);
-    const updated = await this.repo.fillIfAccepted(id, solver, patch, nowSec);
+    const updated = await this.transitionWithOutbox(
+      (intents) => intents.fillIfAccepted(id, solver, patch, nowSec),
+      fillIntentEntry,
+    );
     if (updated !== null) this.countTransition("accepted", "filled");
     if (this.beginShadowObservation()) {
       // Report from `patch` rather than re-reading: on a lost race the stored
@@ -592,7 +638,10 @@ export class IntentsService {
    * (e.g. a concurrent accept() or sweeper expiry already transitioned it).
    */
   async cancelIfOpen(id: string): Promise<Intent | null> {
-    const updated = await this.repo.cancelIfOpen(id);
+    const updated = await this.transitionWithOutbox(
+      (intents) => intents.cancelIfOpen(id),
+      cancelIntentEntry,
+    );
     if (updated !== null) this.countTransition("open", "cancelled");
     if (this.beginShadowObservation()) {
       const subject = updated ?? (await this.repo.findById(id));
