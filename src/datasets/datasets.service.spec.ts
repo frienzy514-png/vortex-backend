@@ -183,7 +183,10 @@ describe("DatasetsService", () => {
       expect(parquet).not.toBeNull();
 
       const fs = await import("fs/promises");
-      const tmp = `/tmp/svc-roundtrip-${Date.now()}.parquet`;
+      const os = await import("os");
+      const nodePath = await import("path");
+      // OS temp dir rather than a hard-coded /tmp (absent on Windows).
+      const tmp = nodePath.join(os.tmpdir(), `svc-roundtrip-${Date.now()}.parquet`);
       await fs.writeFile(tmp, parquet!);
       const reader = await ParquetReader.openFile(tmp);
       const cursor = reader.getCursor();

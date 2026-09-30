@@ -6,7 +6,31 @@ The public protocol transparency endpoint is intentionally designed as a stable 
 
 ### GET /api/v1/stats/public
 
-Legacy stats endpoint with protocol-wide metrics.
+Public protocol metrics endpoint with a reproducible provenance block. The payload remains additive and stable; callers should treat the response as canonical for the current snapshot, with provenance metadata describing the watermark, generation time, query version, dataset URL, and a signature over the canonical payload.
+
+Example payload:
+```json
+{
+  "totalIntents": 42,
+  "openIntents": 7,
+  "totalVolume": "123456",
+  "uniqueUsers": 18,
+  "activeSolvers": 5,
+  "avgFillTime": 120,
+  "fillRate": 0.4,
+  "provenance": {
+    "watermarkLedger": 0,
+    "generatedAt": "2026-09-28T00:00:00.000Z",
+    "queryVersion": "public-stats/v1",
+    "datasetUrl": "https://example.invalid/public-stats/latest.json",
+    "signature": "<hex-digest>"
+  }
+}
+```
+
+### GET /api/v1/stats/public/history
+
+List of signed public snapshots captured over time for independent verification and audit trails.
 
 ### GET /api/v1/treasury/reconciliation
 
